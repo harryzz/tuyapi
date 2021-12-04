@@ -11,6 +11,7 @@ const debug = require('debug')('TuyAPI');
 const {isValidString} = require('./lib/utils');
 const {MessageParser, CommandType} = require('./lib/message-parser');
 const {UDP_KEY} = require('./lib/config');
+const { resolve } = require('path');
 
 /**
  * Represents a Tuya device.
@@ -30,7 +31,7 @@ const {UDP_KEY} = require('./lib/config');
  * @param {Number} [options.version=3.1] protocol version
  * @param {Boolean} [options.nullPayloadOnJSONError=false] if true, emits a data event
  * containing a payload of null values for on-device JSON parsing errors
- * @param {Boolean} [options.issueGetOnConnect=true] if true, sends GET request after
+ * @param {Boolean} [options.issueGetOnConnect=false] if true, sends GET request after
  * connection is established. This should probably be `false` in synchronous usage.
  * @param {Boolean} [options.issueRefreshOnConnect=false] if true, sends DP_REFRESH request after
  * connection is established. This should probably be `false` in synchronous usage.
@@ -102,6 +103,9 @@ class TuyaDevice extends EventEmitter {
     // List of dps which needed CommandType.DP_REFRESH (command 18) to force refresh their values.
     // Power data - DP 19 on some 3.1/3.3 devices, DP 5 for some 3.1 devices.
     this._dpRefreshIds = [4, 5, 6, 18, 19, 20];
+    this._tmpLocalKey = null;
+    this._tmpRemoteKey = null;
+    this.session_key = null;
   }
 
   /**
@@ -127,7 +131,7 @@ class TuyaDevice extends EventEmitter {
    * returns boolean if single property is requested, otherwise returns object of results
    */
   get(options = {}) {
-    const payload = {
+    let payload = {
       gwId: this.device.gwID,
       devId: this.device.id,
       t: Math.round(new Date().getTime() / 1000).toString(),
@@ -145,7 +149,7 @@ class TuyaDevice extends EventEmitter {
     // Create byte buffer
     const buffer = this.device.parser.encode({
       data: payload,
-      commandByte: CommandType.DP_QUERY,
+      commandByte: (this.device.version === '3.4')?CommandType.DP_QUERY_NEW:CommandType.DP_QUERY,
       sequenceN: ++this._currentSequenceN
     });
 
@@ -153,7 +157,8 @@ class TuyaDevice extends EventEmitter {
     return new Promise((resolve, reject) => {
       // Send request
       this._send(buffer).then(async data => {
-        if (data === 'json obj data unvalid') {
+        //console.log("DATA:" + data)
+        if (data === 'json obj data unvalid' /*|| data === 'data format error' || data === 'devid not found'*/) {
           // Some devices don't respond to DP_QUERY so, for DPS get commands, fall
           // back to using SEND with null value. This appears to always work as
           // long as the DPS key exist on the device.
@@ -321,6 +326,7 @@ class TuyaDevice extends EventEmitter {
     const timeStamp = parseInt(new Date() / 1000, 10);
 
     // Construct payload
+
     let payload = {
       t: timeStamp,
       dps
@@ -336,15 +342,39 @@ class TuyaDevice extends EventEmitter {
         ...payload
       };
     }
+    //3.4 payload
+    /*
+    {
+      "data": {
+        "cid": "xxxxxxxxxxxxxxxx",
+        "ctype": 0,
+        "dps": {
+          "1": "manual"
+        }
+      },
+      "protocol": 5,
+      "t": 1633243332
+    }
+    */
+    //end 3.4 payload
+    let payload34={}
+    if(this.device.version === '3.4') {
+      payload.ctype=0
+      payload34 = {
+        data:payload,
+        protocol:5,
+        t:timeStamp
+      }
+    }
 
     debug('SET Payload:');
-    debug(payload);
+    debug((this.device.version === '3.4')?payload34:payload);
 
     // Encode into packet
     const buffer = this.device.parser.encode({
-      data: payload,
+      data: (this.device.version === '3.4')?payload34:payload,
       encrypted: true, // Set commands must be encrypted
-      commandByte: CommandType.CONTROL,
+      commandByte: (this.device.version === '3.4')?CommandType.CONTROL_NEW:CommandType.CONTROL,
       sequenceN: ++this._currentSequenceN
     });
 
@@ -423,11 +453,13 @@ class TuyaDevice extends EventEmitter {
 
     this._pingPongTimeout = setTimeout(() => {
       if (this._lastPingAt < now) {
+        console.log('PING DISCONNECT')
         this.disconnect();
       }
     }, this._responseTimeout * 1000);
 
     // Send ping
+    // console.log('ping: ' + buffer.toString('hex'))
     this.client.write(buffer);
   }
 
@@ -531,11 +563,35 @@ class TuyaDevice extends EventEmitter {
         this.client.on('connect', async () => {
           debug('Socket connected.');
 
-          this._connected = true;
-
           // Remove connect timeout
           this.client.setTimeout(0);
 
+          // proto 3.4
+          // negotiate session key then emit 'connected'
+          // 16 bytes random + 32 bytes hmac
+          if(this.device.version === '3.4') {
+
+            try {
+              
+              this._tmpLocalKey = this.device.parser.cipher.random();
+              const buffer = this.device.parser.encode({
+                data: this._tmpLocalKey,
+                encrypted: true,
+                commandByte: CommandType.BIND,
+                sequenceN: ++this._currentSequenceN
+              });
+
+              this.client.write(buffer)
+            } catch(_) {
+              debug("debug: " + _)
+            } 
+            resolve(true);
+
+          // end proto 3.4
+          } else {
+      
+          this._connected = true;
+          
           /**
            * Emitted when socket is connected
            * to device. This event may be emitted
@@ -547,9 +603,12 @@ class TuyaDevice extends EventEmitter {
           this.emit('connected');
 
           // Periodically send heartbeat ping
+         
+          
           this._pingPongInterval = setInterval(async () => {
             await this._sendPing();
           }, this._pingPongPeriod * 1000);
+          
 
           // Automatically ask for dp_refresh so we
           // can emit a `dp_refresh` event as soon as possible
@@ -565,6 +624,7 @@ class TuyaDevice extends EventEmitter {
 
           // Return
           resolve(true);
+        }
         });
       });
     }
@@ -576,6 +636,59 @@ class TuyaDevice extends EventEmitter {
   _packetHandler(packet) {
     // Response was received, so stop waiting
     clearTimeout(this._sendTimeout);
+
+    if (packet.commandByte === CommandType.RENAME_GW) {
+      // 16 bytes _tmpRemoteKey and hmac on _tmpLocalKey
+      this._tmpRemoteKey = packet.payload.subarray(0, 16)
+      debug('LOCAL RND: ' + this._tmpLocalKey.toString('hex'))
+      debug('REMOTE RND: ' + this._tmpRemoteKey.toString('hex'))
+      
+      const calcLocalHmac =  this.device.parser.cipher.hmac(this._tmpLocalKey).toString('hex')
+      const expLocalHmac = packet.payload.slice(16, 16 +32).toString('hex')
+      if (expLocalHmac !== calcLocalHmac) {
+        throw new Error(`HMAC mismatch(keys): expected ${expLocalHmac}, was ${calcLocalHmac}. ${packet.payload.toString('hex')}`);
+      }
+
+      //send response 0x05
+      const buffer = this.device.parser.encode({
+        data: this.device.parser.cipher.hmac(this._tmpRemoteKey),
+        encrypted: true,
+        commandByte: CommandType.RENAME_DEVICE,
+        sequenceN: ++this._currentSequenceN
+      });
+
+      this.client.write(buffer)
+
+      //calculate session key
+      this.session_key = Buffer.from(this._tmpLocalKey)
+      for( let i=0; i<this._tmpLocalKey.length; i++) {
+       this.session_key[i] = this._tmpLocalKey[i] ^ this._tmpRemoteKey[i]
+      }
+      
+      this.session_key = this.device.parser.cipher.encrypt34({data:this.session_key});
+      debug('SESSION KEY: ' + this.session_key.toString('hex'))
+
+      this.device.parser.cipher.setSessionKey(this.session_key)
+      this.device.key = this.session_key
+
+      this._connected = true;
+      this.emit('connected');
+
+      if (this.globalOptions.issueGetOnConnect) {
+        this.get();
+      }
+
+      if (this.globalOptions.issueRefreshOnConnect) {
+        this.refresh();
+      }
+
+      // Periodically send heartbeat ping
+      this._pingPongInterval = setInterval(async () => {
+            await this._sendPing();
+          }, this._pingPongPeriod * 1000);
+
+      return;
+    }
 
     if (packet.commandByte === CommandType.HEART_BEAT) {
       debug(`Pong from ${this.device.ip}`);
@@ -590,7 +703,7 @@ class TuyaDevice extends EventEmitter {
       return;
     }
 
-    if (packet.commandByte === CommandType.CONTROL && packet.payload === false) {
+    if ( ( packet.commandByte === CommandType.CONTROL || packet.commandByte === CommandType.CONTROL_NEW ) && packet.payload === false) {
       debug('Got SET ack.');
       return;
     }
@@ -600,6 +713,10 @@ class TuyaDevice extends EventEmitter {
       debug('Received DP_REFRESH empty response packet.');
       return;
     }
+
+    //if(packet.commandByte === CommandType.STATUS && packet.payload && packet.payload.dps) {
+    //  console.log('PACKET DPS1: ' + packet.payload.dps[1])
+    //}
 
     if (packet.commandByte === CommandType.STATUS && packet.payload && packet.payload.dps && typeof packet.payload.dps[1] === 'undefined') {
       debug('Received DP_REFRESH packet.');
@@ -615,6 +732,7 @@ class TuyaDevice extends EventEmitter {
       this.emit('dp-refresh', packet.payload, packet.commandByte, packet.sequenceN);
     } else {
       debug('Received DATA packet');
+      debug('data: ' + packet.commandByte + ' : ' + packet.payload.toString('hex'))
       /**
        * Emitted when data is returned from device.
        * @event TuyaDevice#data
@@ -628,7 +746,9 @@ class TuyaDevice extends EventEmitter {
     }
 
     // Status response to SET command
-    if (packet.sequenceN === 0 &&
+    
+    //3.4 response sequenceN is not '0' just next
+    if (/*packet.sequenceN === 0 &&*/
         packet.commandByte === CommandType.STATUS &&
         typeof this._setResolver === 'function') {
       this._setResolver(packet.payload);
@@ -659,6 +779,7 @@ class TuyaDevice extends EventEmitter {
     debug('Disconnect');
 
     this._connected = false;
+    this.device.parser.cipher.setSessionKey(null)
 
     // Clear timeouts
     clearTimeout(this._sendTimeout);
